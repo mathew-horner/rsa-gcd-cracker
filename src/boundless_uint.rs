@@ -56,7 +56,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn parse_valid_big_number() {
+    fn parse_valid_boundless_uint() {
         assert_eq!(
             "53267".parse::<BoundlessUint>().unwrap(),
             BoundlessUint(vec![5, 3, 2, 6, 7])
@@ -64,7 +64,7 @@ mod test {
     }
 
     #[test]
-    fn parse_invalid_big_number() {
+    fn parse_invalid_boundless_uint() {
         assert_eq!(
             "12t65".parse::<BoundlessUint>().unwrap_err().to_string(),
             "non digit character encountered in input: t",
@@ -72,12 +72,12 @@ mod test {
     }
 
     #[test]
-    fn convert_u32_to_big_number() {
+    fn convert_u32_to_boundless_uint() {
         assert_eq!(BoundlessUint::from(4567), BoundlessUint(vec![4, 5, 6, 7]));
     }
 
     #[test]
-    fn big_number_division() {
+    fn boundless_uint_division() {
         assert_eq!(
             &BoundlessUint::from(1224) / &BoundlessUint::from(18),
             BoundlessUint::from(68),
