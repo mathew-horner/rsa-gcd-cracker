@@ -1,110 +1,140 @@
-use crate::boundless_uint::{euclid, BoundlessUint};
+use std::{fs, path::Path};
 
-/// Contains a public / private RSA key pair.
-#[derive(Debug, Eq, PartialEq)]
-pub struct KeyPair {
-    pub private: PrivateKey,
-    pub public: BoundlessUint,
+use openssl::bn::{BigNum, BigNumContext};
+use openssl::pkey::{Private, Public};
+use openssl::rsa::{Padding, Rsa};
+
+use crate::math::euclid;
+
+pub struct Challenge {
+    pub number: usize,
+    pub public_key: Rsa<Public>,
+    pub encrypted_message: Vec<u8>,
 }
 
-/// Attempt to crack two RSA public keys using a Common Factor Attack.
-///
-/// This method relies upon using GCD to discover shared factors between two keys (p or q).
-/// If a shared factor is found, the other two are easily found by dividing each respective
-/// public key by the shared factor.
-///
-/// Though it is not common, some historical bugs in random number generators can lead to
-/// factors being re-used between keys.
-pub fn attempt_crack(
-    public_key1: BoundlessUint,
-    public_key2: BoundlessUint,
-) -> Option<(KeyPair, KeyPair)> {
-    let gcd = euclid(&public_key1, &public_key2);
-
-    // If GCD is 1, there is no shared prime between the keys and thus a crack is unfeasible.
-    if gcd == BoundlessUint::from(1) {
-        return None;
+impl Challenge {
+    pub fn read(number: usize) -> Self {
+        let pem = fs::read(Path::new(&format!("challenge/{number}.pem"))).unwrap();
+        let encrypted_message = fs::read(Path::new(&format!("challenge/{number}.bin"))).unwrap();
+        Self {
+            number,
+            public_key: Rsa::public_key_from_pem(&pem).unwrap(),
+            encrypted_message,
+        }
     }
 
-    // If GCD is *not* 1, it is the shared prime between the keys and can be used to determine the others.
-    let shared = gcd;
-    let left = &public_key1 / &shared;
-    let right = &public_key2 / &shared;
+    /// Attempt to crack two RSA public keys using a Common Factor Attack.
+    ///
+    /// This method relies upon using GCD to discover shared factors between two keys (p or q).
+    /// If a shared factor is found, the other two are easily found by dividing each respective
+    /// public key by the shared factor.
+    ///
+    /// Though it is not common, some historical bugs in random number generators can lead to
+    /// factors being re-used between keys.
+    pub fn attempt(&self, other: &Challenge) -> Option<(Solution, Solution)> {
+        let gcd = euclid(
+            self.public_key.n().to_owned().unwrap(),
+            other.public_key.n().to_owned().unwrap(),
+        );
 
-    Some((
-        KeyPair {
-            private: PrivateKey(shared.clone(), left),
-            public: public_key1,
-        },
-        KeyPair {
-            private: PrivateKey(shared, right),
-            public: public_key2,
-        },
-    ))
-}
+        // If GCD is 1, there is no shared prime between the keys and thus a crack is unfeasible.
+        if gcd == BigNum::from_u32(1).unwrap() {
+            return None;
+        }
 
-/// Contains the p and q values that make up an RSA private key, though distinguishing between
-/// the two is of no consequence to this program.
-#[derive(Debug)]
-pub struct PrivateKey(BoundlessUint, BoundlessUint);
+        // If GCD is *not* 1, it is the shared prime between the keys and can be used to determine the others.
+        let a = self.public_key.n() / gcd.as_ref();
+        let c = other.public_key.n() / gcd.as_ref();
 
-impl PartialEq for PrivateKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0 && self.1 == other.1 || self.0 == other.1 && self.1 == other.0
+        Some((
+            Solution::solve(
+                self.number,
+                build_private_key(
+                    self.public_key.n().to_owned().unwrap(),
+                    self.public_key.e().to_owned().unwrap(),
+                    gcd.as_ref().to_owned().unwrap(),
+                    a,
+                ),
+                &self.encrypted_message,
+            ),
+            Solution::solve(
+                other.number,
+                build_private_key(
+                    other.public_key.n().to_owned().unwrap(),
+                    other.public_key.e().to_owned().unwrap(),
+                    gcd,
+                    c,
+                ),
+                &other.encrypted_message,
+            ),
+        ))
     }
 }
 
-impl Eq for PrivateKey {}
+pub struct Solution {
+    pub challenge: usize,
+    pub private_key: Rsa<Private>,
+    pub decrypted_message: String,
+}
+
+impl Solution {
+    fn solve(challenge_number: usize, private_key: Rsa<Private>, encrypted_message: &[u8]) -> Self {
+        let mut buf = [0; 128];
+        let size = private_key
+            .private_decrypt(encrypted_message, &mut buf, Padding::PKCS1)
+            .unwrap();
+        Self {
+            challenge: challenge_number,
+            private_key,
+            decrypted_message: String::from_utf8(Vec::from(&buf[..size])).unwrap(),
+        }
+    }
+}
+
+fn build_private_key(n: BigNum, e: BigNum, p: BigNum, q: BigNum) -> Rsa<Private> {
+    let one = BigNum::from_u32(1).unwrap();
+    let p1 = &p - &one;
+    let q1 = &q - &one;
+    let phi = &p1 * &q1;
+    let mut d = BigNum::new().unwrap();
+    d.mod_inverse(&e, &phi, &mut BigNumContext::new().unwrap())
+        .unwrap();
+
+    let dmp1 = &d % &p1;
+    let dmq1 = &d % &q1;
+
+    let mut iqmp = BigNum::new().unwrap();
+    iqmp.mod_inverse(&q, &p, &mut BigNumContext::new().unwrap())
+        .unwrap();
+
+    Rsa::from_private_components(n, e, d, p, q, dmp1, dmq1, iqmp).unwrap()
+}
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
 
     #[test]
-    fn private_key_comparison() {
-        assert_eq!(
-            PrivateKey(BoundlessUint::from(13), BoundlessUint::from(53)),
-            PrivateKey(BoundlessUint::from(13), BoundlessUint::from(53))
-        );
-    }
+    fn produces_solution_for_known_key() {
+        let message = "Hello World!";
+        let private_key = Rsa::generate(1024).unwrap();
 
-    #[test]
-    fn private_key_comparison_flipped() {
-        assert_eq!(
-            PrivateKey(BoundlessUint::from(13), BoundlessUint::from(53)),
-            PrivateKey(BoundlessUint::from(53), BoundlessUint::from(13))
-        );
-    }
+        let mut buf = [0; 128];
+        private_key
+            .public_encrypt(message.as_bytes(), &mut buf, Padding::PKCS1)
+            .unwrap();
 
-    #[test]
-    fn crack_keys_with_shared_prime() {
-        // 13 is the shared prime.
-        let public_key1 = BoundlessUint::from(13 * 53);
-        let public_key2 = BoundlessUint::from(13 * 97);
-
-        let (pair1, pair2) = attempt_crack(public_key1.clone(), public_key2.clone()).unwrap();
-
-        assert_eq!(
-            pair1,
-            KeyPair {
-                private: PrivateKey(BoundlessUint::from(13), BoundlessUint::from(53)),
-                public: public_key1
-            }
+        let solution = Solution::solve(
+            0,
+            build_private_key(
+                private_key.n().to_owned().unwrap(),
+                private_key.e().to_owned().unwrap(),
+                private_key.p().unwrap().to_owned().unwrap(),
+                private_key.q().unwrap().to_owned().unwrap(),
+            ),
+            &buf,
         );
-        assert_eq!(
-            pair2,
-            KeyPair {
-                private: PrivateKey(BoundlessUint::from(13), BoundlessUint::from(97)),
-                public: public_key2
-            }
-        );
-    }
 
-    #[test]
-    fn crack_keys_without_shared_prime() {
-        assert_eq!(
-            attempt_crack(BoundlessUint::from(13 * 29), BoundlessUint::from(53 * 97)),
-            None
-        );
+        assert_eq!(solution.decrypted_message, message);
     }
 }

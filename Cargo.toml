@@ -7,3 +7,5 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.76"
+num-bigint = "0.4.4"
+openssl = "0.10.62"
